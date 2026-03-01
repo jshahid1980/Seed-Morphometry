@@ -1,0 +1,366 @@
+"""
+End-to-end ML workflow for regression on 'TKW'
+- Loads D:\ml_asma\pheno_data_mlk.xlsx (first sheet)
+- Automatically preprocesses (impute, encode, scale when needed)
+- Trains a suite of strong, modern models
+- Evaluates with CV + test metrics
+- Saves EVERYTHING as CSVs to ./ml_outputs
+
+Optional (if installed): XGBoost, LightGBM, CatBoost
+"""
+
+import os
+import sys
+import json
+import math
+import warnings
+from pathlib import Path
+from typing import Dict, Any, List, Tuple
+
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split, KFold, cross_val_score
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.inspection import permutation_importance
+
+# Core models (always available with scikit-learn)
+from sklearn.linear_model import Ridge, Lasso, ElasticNet
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.neural_network import MLPRegressor
+from sklearn.ensemble import (
+    RandomForestRegressor,
+    ExtraTreesRegressor,
+    GradientBoostingRegressor,
+    HistGradientBoostingRegressor,
+)
+
+# Optional libraries (will be skipped if not installed)
+HAS_XGB = False
+HAS_LGBM = False
+HAS_CATB = False
+try:
+    from xgboost import XGBRegressor
+    HAS_XGB = True
+except Exception:
+    pass
+try:
+    from lightgbm import LGBMRegressor
+    HAS_LGBM = True
+except Exception:
+    pass
+try:
+    from catboost import CatBoostRegressor
+    HAS_CATB = True
+except Exception:
+    pass
+
+warnings.filterwarnings("ignore")
+
+# ---------- Configuration ----------
+RANDOM_STATE = 42
+TEST_SIZE = 0.2
+N_SPLITS = 5
+OUTPUT_DIR = Path("ml_outputs")
+EXCEL_FILE = Path(__file__).with_name("pheno_data_mlk.xlsx")
+TARGET = "TKW"
+
+# Toggle this if you want a (small) permutation importance on best model
+COMPUTE_PERM_IMPORTANCE = True
+PERM_N_REPEATS = 5
+# -----------------------------------
+
+
+def load_data(xlsx_path: Path, target: str) -> Tuple[pd.DataFrame, pd.Series]:
+    if not xlsx_path.exists():
+        raise FileNotFoundError(f"Excel file not found: {xlsx_path}")
+
+    df = pd.read_excel(xlsx_path, engine="openpyxl")
+    if target not in df.columns:
+        raise KeyError(f"Target column '{target}' not found. Available: {list(df.columns)}")
+
+    # Drop empty columns
+    df = df.dropna(axis=1, how="all")
+
+    # Make sure target is numeric
+    y = pd.to_numeric(df[target], errors="coerce")
+    X = df.drop(columns=[target])
+
+    # Drop rows where target is NaN after coercion
+    mask = y.notna()
+    dropped = len(y) - mask.sum()
+    if dropped > 0:
+        print(f"[Info] Dropped {dropped} rows with non-numeric '{TARGET}'.")
+    X, y = X.loc[mask].reset_index(drop=True), y.loc[mask].reset_index(drop=True)
+
+    return X, y
+
+
+def build_preprocessors(X: pd.DataFrame) -> Tuple[ColumnTransformer, ColumnTransformer, List[str], List[str]]:
+    cat_cols = [c for c in X.columns if X[c].dtype == "object" or str(X[c].dtype).startswith("category") or str(X[c].dtype) == "bool"]
+    num_cols = [c for c in X.columns if c not in cat_cols]
+
+    numeric_scaled = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler())
+    ])
+    numeric_unscaled = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median"))
+    ])
+    categorical = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore"))
+    ])
+
+    preprocessor_scaled = ColumnTransformer(
+        transformers=[
+            ("num", numeric_scaled, num_cols),
+            ("cat", categorical, cat_cols)
+        ],
+        remainder="drop"
+    )
+    preprocessor_unscaled = ColumnTransformer(
+        transformers=[
+            ("num", numeric_unscaled, num_cols),
+            ("cat", categorical, cat_cols)
+        ],
+        remainder="drop"
+    )
+    return preprocessor_scaled, preprocessor_unscaled, num_cols, cat_cols
+
+
+def model_zoo() -> Dict[str, Dict[str, Any]]:
+    """
+    Returns models with whether they need scaling.
+    """
+    models = {
+        # Linear family
+        "Ridge": {"est": Ridge(random_state=RANDOM_STATE), "scaled": True},
+        "Lasso": {"est": Lasso(random_state=RANDOM_STATE), "scaled": True},
+        "ElasticNet": {"est": ElasticNet(random_state=RANDOM_STATE), "scaled": True},
+
+        # Neighbors / SVM / NN
+        "KNN": {"est": KNeighborsRegressor(n_neighbors=7), "scaled": True},
+        "SVR": {"est": SVR(C=10.0, epsilon=0.1, kernel="rbf"), "scaled": True},
+        "MLP": {"est": MLPRegressor(hidden_layer_sizes=(128, 64), activation="relu",
+                                    learning_rate_init=0.001, max_iter=500, random_state=RANDOM_STATE),
+                "scaled": True},
+
+        # Tree & Boosting (no scaling)
+        "RandomForest": {"est": RandomForestRegressor(
+            n_estimators=400, max_depth=None, min_samples_split=2,
+            n_jobs=-1, random_state=RANDOM_STATE), "scaled": False},
+        "ExtraTrees": {"est": ExtraTreesRegressor(
+            n_estimators=600, max_depth=None, min_samples_split=2,
+            n_jobs=-1, random_state=RANDOM_STATE), "scaled": False},
+        "GradientBoosting": {"est": GradientBoostingRegressor(
+            learning_rate=0.05, n_estimators=600, max_depth=3, random_state=RANDOM_STATE), "scaled": False},
+        "HistGradientBoosting": {"est": HistGradientBoostingRegressor(
+            learning_rate=0.05, max_depth=None, max_bins=255,
+            l2_regularization=0.0, early_stopping=True, random_state=RANDOM_STATE), "scaled": False},
+    }
+    if HAS_XGB:
+        models["XGBoost"] = {"est": XGBRegressor(
+            n_estimators=800, max_depth=6, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0,
+            random_state=RANDOM_STATE, n_jobs=-1, tree_method="hist", objective="reg:squarederror"),
+            "scaled": False}
+    if HAS_LGBM:
+        models["LightGBM"] = {"est": LGBMRegressor(
+            n_estimators=1000, max_depth=-1, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0,
+            random_state=RANDOM_STATE, n_jobs=-1), "scaled": False}
+    if HAS_CATB:
+        # CatBoost is robust with defaults; verbose=False to keep console clean
+        models["CatBoost"] = {"est": CatBoostRegressor(
+            depth=8, learning_rate=0.05, n_estimators=1000,
+            loss_function="RMSE", random_state=RANDOM_STATE, verbose=False), "scaled": False}
+    return models
+
+
+def metrics_dict(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    mae = mean_absolute_error(y_true, y_pred)
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = math.sqrt(mse)
+    r2 = r2_score(y_true, y_pred)
+    # Safe MAPE (ignore zeros)
+    nonzero = np.abs(y_true) > 1e-12
+    mape = np.mean(np.abs((y_true[nonzero] - y_pred[nonzero]) / y_true[nonzero])) * 100 if np.any(nonzero) else np.nan
+    return {"MAE": mae, "MSE": mse, "RMSE": rmse, "R2": r2, "MAPE_%": mape}
+
+
+def get_feature_names(fitted_preprocessor: ColumnTransformer) -> List[str]:
+    # Works for sklearn >= 1.0
+    try:
+        names = list(fitted_preprocessor.get_feature_names_out())
+        return names
+    except Exception:
+        # Fallback: generic names
+        n_out = fitted_preprocessor.transformers_[0][1]["imputer"].statistics_.shape[0]
+        return [f"f_{i}" for i in range(n_out)]
+
+
+def save_csv(df: pd.DataFrame, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False)
+
+
+def main():
+    print("=== ML Workflow: TKW Regression ===")
+    print(f"Reading Excel: {EXCEL_FILE}")
+
+    X, y = load_data(EXCEL_FILE, TARGET)
+    print(f"Data shape: X={X.shape}, y={y.shape}")
+
+    preproc_scaled, preproc_unscaled, num_cols, cat_cols = build_preprocessors(X)
+    print(f"Numeric cols: {len(num_cols)}, Categorical cols: {len(cat_cols)}")
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE
+    )
+    print(f"Train: {X_train.shape}, Test: {X_test.shape}")
+
+    kf = KFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+
+    models = model_zoo()
+
+    cv_rows = []
+    test_rows = []
+    params_rows = []
+
+    best_model_name = None
+    best_rmse = float("inf")
+    best_pipeline = None
+    best_feature_names = None
+    best_preds = None
+
+    for name, cfg in models.items():
+        use_scaled = cfg["scaled"]
+        est = cfg["est"]
+
+        pre = preproc_scaled if use_scaled else preproc_unscaled
+        pipe = Pipeline(steps=[("prep", pre), ("model", est)])
+
+        # Cross-validated metrics
+        print(f"\n[CV] Training {name} ...")
+        # Neg MSE for RMSE
+        neg_mse_scores = cross_val_score(pipe, X_train, y_train, scoring="neg_mean_squared_error", cv=kf, n_jobs=-1)
+        neg_mae_scores = cross_val_score(pipe, X_train, y_train, scoring="neg_mean_absolute_error", cv=kf, n_jobs=-1)
+        r2_scores = cross_val_score(pipe, X_train, y_train, scoring="r2", cv=kf, n_jobs=-1)
+
+        rmse_scores = np.sqrt(-neg_mse_scores)
+        mae_scores = -neg_mae_scores
+
+        cv_rows.append({
+            "Model": name,
+            "CV_RMSE_mean": rmse_scores.mean(),
+            "CV_RMSE_std": rmse_scores.std(),
+            "CV_MAE_mean": mae_scores.mean(),
+            "CV_MAE_std": mae_scores.std(),
+            "CV_R2_mean": r2_scores.mean(),
+            "CV_R2_std": r2_scores.std()
+        })
+
+        # Fit on full train, evaluate on test
+        print(f"[FIT] {name}")
+        pipe.fit(X_train, y_train)
+
+        y_pred = pipe.predict(X_test)
+        m = metrics_dict(y_test.values, y_pred)
+
+        row = {"Model": name}
+        row.update(m)
+        test_rows.append(row)
+
+        # Persist params (of the underlying estimator)
+        try:
+            model_params = pipe.named_steps["model"].get_params()
+            params_rows.append({"Model": name, "Params": json.dumps(model_params)})
+        except Exception:
+            params_rows.append({"Model": name, "Params": "unavailable"})
+
+        # Save predictions
+        preds_df = pd.DataFrame({"y_true": y_test.values, "y_pred": y_pred})
+        save_csv(preds_df, OUTPUT_DIR / f"predictions_{name}.csv")
+
+        # Track best by RMSE
+        if m["RMSE"] < best_rmse:
+            best_rmse = m["RMSE"]
+            best_model_name = name
+            best_pipeline = pipe
+            best_preds = preds_df.copy()
+
+            # After fit, we can extract feature names for importances
+            try:
+                best_feature_names = get_feature_names(pipe.named_steps["prep"])
+            except Exception:
+                best_feature_names = None
+
+        # Feature importance (native) for this model if available
+        try:
+            fitted_model = pipe.named_steps["model"]
+            importances = None
+            # Trees/boosters
+            if hasattr(fitted_model, "feature_importances_"):
+                importances = fitted_model.feature_importances_
+            # Linear
+            elif hasattr(fitted_model, "coef_"):
+                coef = fitted_model.coef_
+                importances = np.abs(coef) if np.ndim(coef) > 0 else np.array([abs(coef)])
+
+            if importances is not None and best_feature_names is not None:
+                # get names for this specific pipe (not just best)
+                feat_names = get_feature_names(pipe.named_steps["prep"])
+                imp_df = pd.DataFrame({"feature": feat_names, "importance": importances})
+                imp_df = imp_df.sort_values("importance", ascending=False)
+                save_csv(imp_df, OUTPUT_DIR / f"feature_importance_{name}.csv")
+        except Exception:
+            pass
+
+    # Save CV summary & test summary & params
+    cv_df = pd.DataFrame(cv_rows).sort_values("CV_RMSE_mean")
+    test_df = pd.DataFrame(test_rows).sort_values("RMSE")
+    params_df = pd.DataFrame(params_rows)
+
+    save_csv(cv_df, OUTPUT_DIR / "metrics_cv.csv")
+    save_csv(test_df, OUTPUT_DIR / "metrics_test.csv")
+    save_csv(params_df, OUTPUT_DIR / "model_params.jsonl.csv")  # JSON in a CSV cell
+
+    print("\n=== Results saved to ./ml_outputs ===")
+    print(test_df.to_string(index=False))
+
+    # Permutation importance on BEST model (optional)
+    if COMPUTE_PERM_IMPORTANCE and best_pipeline is not None:
+        print(f"\n[Permutation Importance] on best model: {best_model_name}")
+        try:
+            r = permutation_importance(
+                best_pipeline, X_test, y_test,
+                n_repeats=PERM_N_REPEATS, random_state=RANDOM_STATE, n_jobs=-1
+            )
+            feat_names = get_feature_names(best_pipeline.named_steps["prep"])
+            perm_df = pd.DataFrame({"feature": feat_names, "importance_mean": r.importances_mean, "importance_std": r.importances_std})
+            perm_df = perm_df.sort_values("importance_mean", ascending=False)
+            save_csv(perm_df, OUTPUT_DIR / f"permutation_importance_{best_model_name}.csv")
+        except Exception as e:
+            print(f"[Warn] Permutation importance failed: {e}")
+
+    # Save a final blended leaderboard with CV + Test in one table
+    leaderboard = cv_df.merge(test_df, on="Model", how="outer")
+    save_csv(leaderboard, OUTPUT_DIR / "leaderboard.csv")
+
+    # Also save the best model's predictions (again) as a convenience
+    if best_model_name and best_preds is not None:
+        save_csv(best_preds, OUTPUT_DIR / f"BEST_{best_model_name}_predictions.csv")
+
+    print(f"\nBest Model by Test RMSE: {best_model_name} (RMSE={best_rmse:.4f})")
+    print("Done.")
+
+
+if __name__ == "__main__":
+    np.random.seed(RANDOM_STATE)
+    main()

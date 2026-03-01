@@ -1,0 +1,103 @@
+from plantcv import plantcv as pcv
+import os
+import glob
+import pandas as pd
+import numpy as np
+import cv2
+
+def analyze_seed_image(image_path, scaling_factor_cm=0.01, min_area_px=500, max_area_px=10000):
+    pcv.outputs.clear()
+
+    # Load image using OpenCV
+    img = cv2.imread(image_path)
+    if img is None:
+        raise FileNotFoundError(f"Cannot open image: {image_path}")
+
+    # Convert BGR to RGB
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    # Convert to grayscale
+    gray = pcv.rgb2gray_lab(rgb_img=img_rgb, channel='l')
+
+    # Threshold
+    mask = pcv.threshold.binary(gray_img=gray, threshold=120, object_type='light')
+
+    # Clean mask
+    mask = pcv.fill_holes(mask)
+    mask = pcv.erode(mask, ksize=3, i=1)
+    mask = pcv.dilate(mask, ksize=3, i=1)
+
+    # Find contours
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    seed_measurements = []
+
+    for i, cnt in enumerate(contours):
+        area_px = cv2.contourArea(cnt)
+
+        # Filter by area to remove noise
+        if area_px < min_area_px or area_px > max_area_px:
+            continue
+
+        perimeter_px = cv2.arcLength(cnt, True)
+        x, y, w, h = cv2.boundingRect(cnt)
+
+        # Convert to cm
+        area_cm2 = area_px * (scaling_factor_cm ** 2)
+        width_cm = w * scaling_factor_cm
+        height_cm = h * scaling_factor_cm
+        perimeter_cm = perimeter_px * scaling_factor_cm
+        circularity = (4 * np.pi * area_px) / (perimeter_px ** 2) if perimeter_px > 0 else 0
+
+        seed_measurements.append({
+            'image_name': os.path.basename(image_path),
+            'seed_id': f"{os.path.basename(image_path)}_seed_{len(seed_measurements)+1}",
+            'length_cm': height_cm,
+            'width_cm': width_cm,
+            'area_cm2': area_cm2,
+            'perimeter_cm': perimeter_cm,
+            'circularity': circularity
+        })
+
+    return seed_measurements
+
+def main():
+    image_folder = "D:/mlk/mlk_img/"
+    output_csv = "seed_measurements.csv"
+    image_extensions = ['.jpg', '.jpeg', '.png', '.tif', '.tiff']
+
+    image_files = []
+    for ext in image_extensions:
+        image_files.extend(glob.glob(os.path.join(image_folder, f"*{ext}")))
+
+    print(f"✅ Found {len(image_files)} images to process.")
+
+    all_measurements = []
+
+    for i, img_path in enumerate(image_files):
+        print(f"🔍 Processing {i+1}/{len(image_files)}: {os.path.basename(img_path)}")
+
+        try:
+            seed_data = analyze_seed_image(img_path)
+            all_measurements.extend(seed_data)
+            print(f"   ➤ Valid seeds detected: {len(seed_data)}")
+        except Exception as e:
+            print(f"   ❌ Error: {e}")
+
+    if all_measurements:
+        df = pd.DataFrame(all_measurements)
+        df.to_csv(output_csv, index=False)
+        print(f"\n✅ Results saved to {output_csv}")
+
+        # Summary
+        seed_count = len(df)
+        image_count = len(df['image_name'].unique())
+        print(f"\n📊 Summary:")
+        print(f"Total images processed: {image_count}")
+        print(f"Total seeds measured: {seed_count}")
+        print(f"Average seeds per image: {seed_count / image_count:.2f}")
+    else:
+        print("⚠ No seeds found. Try adjusting threshold or filter values.")
+
+if __name__ == "__main__":
+    main()
